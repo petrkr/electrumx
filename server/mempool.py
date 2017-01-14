@@ -200,7 +200,6 @@ class MemPool(util.LoggedClass):
         '''
         script_hashX = self.coin.hashX_from_script
         deserializer = self.coin.deserializer()
-        db_utxo_lookup = self.db.db_utxo_lookup
         txs = self.txs
 
         # Deserialize each tx and put it in our priority queue
@@ -223,41 +222,44 @@ class MemPool(util.LoggedClass):
         result = {}
         deferred = []
 
-        for item in pending:
-            if self.stop:
-                break
+        with self.db.utxo_read_batch() as batch:
+            utxo_lookup = partial(self.db.utxo_lookup, batch)
 
-            tx_hash, old_txin_pairs, txout_pairs = item
-            if tx_hash not in txs:
-                continue
+            for item in pending:
+                if self.stop:
+                    break
 
-            mempool_missing = False
-            txin_pairs = []
+                tx_hash, old_txin_pairs, txout_pairs = item
+                if tx_hash not in txs:
+                    continue
 
-            try:
-                for prev_hex_hash, prev_idx in old_txin_pairs:
-                    tx_info = txs.get(prev_hex_hash, 0)
-                    if tx_info is None:
-                        tx_info = result.get(prev_hex_hash)
-                        if not tx_info:
-                            mempool_missing = True
-                            continue
-                    if tx_info:
-                        txin_pairs.append(tx_info[1][prev_idx])
-                    elif not mempool_missing:
-                        prev_hash = hex_str_to_hash(prev_hex_hash)
-                        txin_pairs.append(db_utxo_lookup(prev_hash, prev_idx))
-            except (self.db.MissingUTXOError, self.db.DBError):
-                # DBError can happen when flushing a newly processed
-                # block.  MissingUTXOError typically happens just
-                # after the daemon has accepted a new block and the
-                # new mempool has deps on new txs in that block.
-                continue
+                mempool_missing = False
+                txin_pairs = []
 
-            if mempool_missing:
-                deferred.append(item)
-            else:
-                result[tx_hash] = (txin_pairs, txout_pairs)
+                try:
+                    for prev_hex_hash, prev_idx in old_txin_pairs:
+                        tx_info = txs.get(prev_hex_hash, 0)
+                        if tx_info is None:
+                            tx_info = result.get(prev_hex_hash)
+                            if not tx_info:
+                                mempool_missing = True
+                                continue
+                        if tx_info:
+                            txin_pairs.append(tx_info[1][prev_idx])
+                        elif not mempool_missing:
+                            prev_hash = hex_str_to_hash(prev_hex_hash)
+                            txin_pairs.append(utxo_lookup(prev_hash, prev_idx))
+                except (self.db.MissingUTXOError, self.db.DBError):
+                    # DBError can happen when flushing a newly processed
+                    # block.  MissingUTXOError typically happens just
+                    # after the daemon has accepted a new block and the
+                    # new mempool has deps on new txs in that block.
+                    continue
+
+                if mempool_missing:
+                    deferred.append(item)
+                else:
+                    result[tx_hash] = (txin_pairs, txout_pairs)
 
         return result, deferred
 

@@ -373,14 +373,14 @@ class BlockProcessor(server.db.DB):
         self.history_size = 0
 
         # Flush state last as it reads the wall time.
-        with self.utxo_db.write_batch() as batch:
+        with self.utxo_write_batch() as batch:
             if flush_utxos:
                 self.flush_utxos(batch)
             self.flush_state(batch)
 
-        # Update and put the wall time again - otherwise we drop the
-        # time it took to commit the batch
-        self.flush_state(self.utxo_db)
+        # Do this again to capture batch commit time
+        with self.utxo_write_batch() as batch:
+            self.flush_state(batch)
 
         self.logger.info('flush #{:,d} took {:.1f}s.  Height {:,d} txs: {:,d}'
                          .format(self.flush_count,
@@ -446,7 +446,7 @@ class BlockProcessor(server.db.DB):
         self.logger.info('backing up removed {:,d} history entries'
                          .format(nremoves))
 
-        with self.utxo_db.write_batch() as batch:
+        with self.utxo_write_batch() as batch:
             # Flush state last as it reads the wall time.
             self.flush_utxos(batch)
             self.flush_state(batch)
@@ -490,11 +490,12 @@ class BlockProcessor(server.db.DB):
         min_height = self.min_undo_height(self.daemon.cached_height())
         height = self.height
 
-        for block in blocks:
-            height += 1
-            undo_info = self.advance_txs(block_txs(block, height))
-            if height >= min_height:
-                self.undo_infos.append((undo_info, height))
+        with self.utxo_read_batch() as self.su_batch:
+            for block in blocks:
+                height += 1
+                undo_info = self.advance_txs(block_txs(block, height))
+                if height >= min_height:
+                    self.undo_infos.append((undo_info, height))
 
         self.height = height
         self.headers.extend(headers)
@@ -568,18 +569,20 @@ class BlockProcessor(server.db.DB):
         assert self.height >= len(blocks)
 
         coin = self.coin
-        for block in blocks:
-            # Check and update self.tip
-            header = coin.block_header(block, self.height)
-            header_hash = coin.header_hash(header)
-            if header_hash != self.tip:
-                raise ChainError('backup block {} is not tip {} at height {:,d}'
-                                 .format(hash_to_str(header_hash),
-                                         hash_to_str(self.tip), self.height))
-            self.tip = coin.header_prevhash(header)
-            self.backup_txs(coin.block_txs(block, self.height))
-            self.height -= 1
-            self.tx_counts.pop()
+        with self.utxo_read_batch() as self.su_batch:
+            for block in blocks:
+                # Check and update self.tip
+                header = coin.block_header(block, self.height)
+                header_hash = coin.header_hash(header)
+                if header_hash != self.tip:
+                    raise ChainError('bad tip {} ({}) at height {:,d}'
+                                     .format(hash_to_str(header_hash),
+                                             hash_to_str(self.tip),
+                                             self.height))
+                self.tip = coin.header_prevhash(header)
+                self.backup_txs(coin.block_txs(block, self.height))
+                self.height -= 1
+                self.tx_counts.pop()
 
         self.logger.info('backed up to height {:,d}'.format(self.height))
         self.backup_flush()
@@ -693,9 +696,10 @@ class BlockProcessor(server.db.DB):
 
         # Key: b'h' + compressed_tx_hash + tx_idx + tx_num
         # Value: hashX
+        batch = self.su_batch
         prefix = b'h' + tx_hash[:4] + idx_packed
         candidates = {db_key: hashX for db_key, hashX
-                      in self.utxo_db.iterator(prefix=prefix)}
+                      in batch.iterator(prefix=prefix)}
 
         for hdb_key, hashX in candidates.items():
             tx_num_packed = hdb_key[-4:]
@@ -710,7 +714,7 @@ class BlockProcessor(server.db.DB):
             # Key: b'u' + address_hashX + tx_idx + tx_num
             # Value: the UTXO value as a 64-bit unsigned integer
             udb_key = b'u' + hashX + hdb_key[-6:]
-            utxo_value_packed = self.utxo_db.get(udb_key)
+            utxo_value_packed = batch.get(udb_key)
             if utxo_value_packed:
                 # Remove both entries for this UTXO
                 self.db_deletes.append(hdb_key)
@@ -730,23 +734,23 @@ class BlockProcessor(server.db.DB):
         utxo_cache_len = len(self.utxo_cache)
 
         # Spends
-        batch_delete = batch.delete
+        delete = batch.delete
         for key in sorted(self.db_deletes):
-            batch_delete(key)
+            delete(key)
         self.db_deletes = []
 
         # New UTXOs
-        batch_put = batch.put
+        put = batch.put
         for cache_key, cache_value in self.utxo_cache.items():
             # suffix = tx_idx + tx_num
             hashX = cache_value[:-12]
             suffix =  cache_key[-2:] + cache_value[-12:-8]
-            batch_put(b'h' + cache_key[:4] + suffix, hashX)
-            batch_put(b'u' + hashX + suffix, cache_value[-8:])
+            put(b'h' + cache_key[:4] + suffix, hashX)
+            put(b'u' + hashX + suffix, cache_value[-8:])
         self.utxo_cache = {}
 
         # New undo information
-        self.flush_undo_infos(batch_put, self.undo_infos)
+        self.flush_undo_infos(put, self.undo_infos)
         self.undo_infos = []
 
         if self.utxo_db.for_sync:

@@ -23,12 +23,9 @@ from server.version import VERSION
 
 UTXO = namedtuple("UTXO", "tx_num tx_pos tx_hash height value")
 
-class DB(util.LoggedClass):
-    '''Simple wrapper of the backend database for querying.
 
-    Performs no DB update, though the DB will be cleaned on opening if
-    it was shutdown uncleanly.
-    '''
+class DB(util.LoggedClass):
+    '''Simple wrapper of the backend databases for querying.'''
 
     DB_VERSIONS = [5]
 
@@ -132,7 +129,9 @@ class DB(util.LoggedClass):
             self.wall_time = 0
             self.first_sync = True
         else:
-            state = self.utxo_db.get(b'state')
+            with self.utxo_read_batch() as batch:
+                state = batch.get(b'state')
+
             if state:
                 state = ast.literal_eval(state.decode())
             if not isinstance(state, dict):
@@ -263,6 +262,12 @@ class DB(util.LoggedClass):
         assert isinstance(limit, int) and limit >= 0
         return limit
 
+    def utxo_read_batch(self):
+        return self.utxo_db.read_batch()
+
+    def utxo_write_batch(self):
+        return self.utxo_db.write_batch()
+
     def get_balance(self, hashX):
         '''Returns the confirmed balance of an address.'''
         return sum(utxo.value for utxo in self.get_utxos(hashX, limit=None))
@@ -277,42 +282,36 @@ class DB(util.LoggedClass):
         # Key: b'u' + address_hashX + tx_idx + tx_num
         # Value: the UTXO value as a 64-bit unsigned integer
         prefix = b'u' + hashX
-        for db_key, db_value in self.utxo_db.iterator(prefix=prefix):
-            if limit == 0:
-                return
-            limit -= 1
-            tx_pos, tx_num = s_unpack('<HI', db_key[-6:])
-            value, = unpack('<Q', db_value)
-            tx_hash, height = self.fs_tx_hash(tx_num)
-            yield UTXO(tx_num, tx_pos, tx_hash, height, value)
+        with self.utxo_read_batch() as batch:
+            for db_key, db_value in batch.iterator(prefix=prefix):
+                if limit == 0:
+                    return
+                limit -= 1
+                tx_pos, tx_num = s_unpack('<HI', db_key[-6:])
+                value, = unpack('<Q', db_value)
+                tx_hash, height = self.fs_tx_hash(tx_num)
+                yield UTXO(tx_num, tx_pos, tx_hash, height, value)
 
-    def db_hashX(self, tx_hash, idx_packed):
-        '''Return (hashX, tx_num_packed) for the given TXO.
-
-        Both are None if not found.'''
-        # Key: b'h' + compressed_tx_hash + tx_idx + tx_num
-        # Value: hashX
-        prefix = b'h' + tx_hash[:4] + idx_packed
-
-        # Find which entry, if any, the TX_HASH matches.
-        for db_key, hashX in self.utxo_db.iterator(prefix=prefix):
-            tx_num_packed = db_key[-4:]
-            tx_num, = unpack('<I', tx_num_packed)
-            hash, height = self.fs_tx_hash(tx_num)
-            if hash == tx_hash:
-                return hashX, tx_num_packed
-
-        return None, None
-
-    def db_utxo_lookup(self, tx_hash, tx_idx):
+    def utxo_lookup(self, batch, tx_hash, tx_idx):
         '''Given a prevout return a (hashX, value) pair.
 
         Raises MissingUTXOError if the UTXO is not found.  Used by the
         mempool code.
         '''
         idx_packed = pack('<H', tx_idx)
-        hashX, tx_num_packed = self.db_hashX(tx_hash, idx_packed)
-        if not hashX:
+
+        # Key: b'h' + compressed_tx_hash + tx_idx + tx_num
+        # Value: hashX
+        prefix = b'h' + tx_hash[:4] + idx_packed
+
+        # Find which entry, if any, the TX_HASH matches.
+        for db_key, hashX in batch.iterator(prefix=prefix):
+            tx_num_packed = db_key[-4:]
+            tx_num, = unpack('<I', tx_num_packed)
+            hash, height = self.fs_tx_hash(tx_num)
+            if hash == tx_hash:
+                break
+        else:
             # This can happen when the daemon is a block ahead of us
             # and has mempool txs spending outputs from that new block
             raise self.MissingUTXOError
@@ -320,7 +319,7 @@ class DB(util.LoggedClass):
         # Key: b'u' + address_hashX + tx_idx + tx_num
         # Value: the UTXO value as a 64-bit unsigned integer
         key = b'u' + hashX + idx_packed + tx_num_packed
-        db_value = self.utxo_db.get(key)
+        db_value = batch.get(key)
         if not db_value:
             raise self.DBError('UTXO {} / {:,d} in one table only'
                                .format(hash_to_str(tx_hash), tx_idx))
@@ -339,7 +338,8 @@ class DB(util.LoggedClass):
 
     def read_undo_info(self, height):
         '''Read undo information from a file for the current height.'''
-        return self.utxo_db.get(self.undo_key(height))
+        with self.utxo_read_batch() as batch:
+            return batch.get(self.undo_key(height))
 
     def flush_undo_infos(self, batch_put, undo_infos):
         '''undo_infos is a list of (undo_info, height) pairs.'''
@@ -348,43 +348,50 @@ class DB(util.LoggedClass):
 
     def clear_excess_undo_info(self):
         '''Clear excess undo info.  Only most recent N are kept.'''
-        prefix = b'U'
         min_height = self.min_undo_height(self.db_height)
         keys = []
-        for key, hist in self.utxo_db.iterator(prefix=prefix):
-            height, = unpack('>I', key[-4:])
-            if height >= min_height:
-                break
-            keys.append(key)
+        with self.utxo_write_batch() as batch:
+            for key, hist in batch.iterator(prefix=b'U'):
+                height, = unpack('>I', key[-4:])
+                if height >= min_height:
+                    break
+                keys.append(key)
+
+            for key in keys:
+                batch.delete(key)
 
         if keys:
-            with self.utxo_db.write_batch() as batch:
-                for key in keys:
-                    batch.delete(key)
             self.logger.info('deleted {:,d} stale undo entries'
                              .format(len(keys)))
 
     # -- History database
 
+    def hist_read_batch(self):
+        return self.hist_db.read_batch()
+
+    def hist_write_batch(self):
+        return self.hist_db.write_batch()
+
     def clear_excess_history(self, flush_count):
         self.logger.info('DB shut down uncleanly.  Scanning for '
                          'excess history flushes...')
 
-        keys = []
-        for key, hist in self.hist_db.iterator(prefix=b''):
-            flush_id, = unpack('>H', key[-2:])
-            if flush_id > flush_count:
-                keys.append(key)
+        with self.hist_write_batch() as batch:
+            keys = []
+            for key, hist in batch.iterator(prefix=b''):
+                flush_id, = unpack('>H', key[-2:])
+                if flush_id > flush_count:
+                    keys.append(key)
 
-        self.logger.info('deleting {:,d} history entries'.format(len(keys)))
-
-        self.flush_count = flush_count
-        with self.hist_db.write_batch() as batch:
+            delete = batch.delete
             for key in keys:
-                batch.delete(key)
+                delete(key)
+
+            self.flush_count = flush_count
             self.write_history_state(batch)
 
-        self.logger.info('deleted excess history entries')
+        self.logger.info('deleting {:,d} excess history entries'
+                         .format(len(keys)))
 
     def write_history_state(self, batch):
         state = {'flush_count': self.flush_count}
@@ -393,7 +400,8 @@ class DB(util.LoggedClass):
         batch.put(b'state\0\0', repr(state).encode())
 
     def read_history_state(self):
-        state = self.hist_db.get(b'state\0\0')
+        with self.hist_read_batch() as batch:
+            state = batch.get(b'state\0\0')
         if state:
             state = ast.literal_eval(state.decode())
             if not isinstance(state, dict):
@@ -406,10 +414,11 @@ class DB(util.LoggedClass):
         self.flush_count += 1
         flush_id = pack('>H', self.flush_count)
 
-        with self.hist_db.write_batch() as batch:
+        with self.hist_write_batch() as batch:
+            put = batch.put
             for hashX in sorted(history):
                 key = hashX + flush_id
-                batch.put(key, history[hashX].tobytes())
+                put(key, history[hashX].tobytes())
             self.write_history_state(batch)
 
     def backup_history(self, hashXs):
@@ -417,12 +426,11 @@ class DB(util.LoggedClass):
         self.flush_count += 1
         nremoves = 0
 
-        with self.hist_db.write_batch() as batch:
+        with self.hist_write_batch() as batch:
             for hashX in sorted(hashXs):
                 deletes = []
                 puts = {}
-                for key, hist in self.hist_db.iterator(prefix=hashX,
-                                                       reverse=True):
+                for key, hist in batch.iterator(prefix=hashX, reverse=True):
                     a = array.array('I')
                     a.frombytes(hist)
                     # Remove all history entries >= self.tx_count
@@ -433,10 +441,13 @@ class DB(util.LoggedClass):
                         break
                     deletes.append(key)
 
+                delete = batch.delete
                 for key in deletes:
-                    batch.delete(key)
+                    delete(key)
+                put = batch.put
                 for key, value in puts.items():
-                    batch.put(key, value)
+                    put(key, value)
+
             self.write_history_state(batch)
 
         return nremoves
@@ -449,11 +460,12 @@ class DB(util.LoggedClass):
         Set limit to None to get them all.
         '''
         limit = self._resolve_limit(limit)
-        for key, hist in self.hist_db.iterator(prefix=hashX):
-            a = array.array('I')
-            a.frombytes(hist)
-            for tx_num in a:
-                if limit == 0:
-                    return
-                yield self.fs_tx_hash(tx_num)
-                limit -= 1
+        with self.hist_read_batch() as batch:
+            for key, hist in batch.iterator(prefix=hashX):
+                a = array.array('I')
+                a.frombytes(hist)
+                for tx_num in a:
+                    if limit == 0:
+                        return
+                    yield self.fs_tx_hash(tx_num)
+                    limit -= 1
